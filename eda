@@ -1,0 +1,179 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+import xgboost as xgb
+import lightgbm as lgb
+from typing import Dict, List, Tuple, Union
+from dataclasses import dataclass
+
+@dataclass
+class ModelConfig:
+    """Model configuration parameters"""
+    input_weeks: int = 4
+    predict_weeks: int = 12
+    n_splits: int = 5
+    n_estimators: int = 100
+    random_state: int = 42
+
+class DataPreprocessor:
+    """Handles data preprocessing tasks"""
+    
+    def __init__(self, price_thresholds: Dict[str, float]):
+        self.price_thresholds = price_thresholds
+        
+    def process_dates(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Convert date columns to datetime format"""
+        df['일자'] = pd.to_datetime(df['일자'], format='%Y%m%d')
+        df['연도'] = df['일자'].dt.year
+        df['월'] = df['일자'].dt.month
+        df['주'] = df['일자'].dt.isocalendar().week
+        return df
+    
+    def filter_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Remove price outliers based on thresholds and z-scores"""
+        # Remove rows where price is less than or equal to 0
+        df = df[df['일평균 도매가격(원/kg)'] > 0]
+        
+        # Apply price thresholds
+        for product, threshold in self.price_thresholds.items():
+            df = df[~((df['품종'] == product) & (df['일평균 도매가격(원/kg)'] >= threshold))]
+        
+        return df
+    
+    def remove_statistical_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Remove statistical outliers using z-score"""
+        def remove_zscore_outliers(group):
+            z_scores = np.abs(stats.zscore(group['일평균 도매가격(원/kg)']))
+            return group[z_scores <= 3]
+        
+        return df.groupby(['연도', '주', '품종']).apply(remove_zscore_outliers).reset_index(drop=True)
+    
+    def add_holiday_info(self, df: pd.DataFrame, holiday_data: pd.DataFrame) -> pd.DataFrame:
+        """Add holiday-related information"""
+        df['주변공휴일'] = 0
+        holiday_data['기준날짜'] = pd.to_datetime(holiday_data['기준날짜'], format='%Y%m%d')
+        
+        for _, row in holiday_data.iterrows():
+            mask = (df['일자'] >= row['기준날짜'] - pd.Timedelta(days=7)) & \
+                   (df['일자'] < row['기준날짜'])
+            df.loc[mask, '주변공휴일'] = 1
+        
+        return df
+    
+    def prepare_regional_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Separate and prepare Jeju and non-Jeju data"""
+        # Separate Jeju and non-Jeju data
+        jeju_data = df[df['생산지 시도'] == '제주']
+        non_jeju_data = df[df['생산지 시도'] != '제주']
+        
+        # Create summary for Jeju region
+        jeju_summary = jeju_data.groupby(['연도', '주', '품목', '품종', '도매시장']).agg(
+            min_price_jeju=('일평균 도매가격(원/kg)', 'min'),
+            mean_price_jeju=('일평균 도매가격(원/kg)', 'mean'),
+            max_price_jeju=('일평균 도매가격(원/kg)', 'max'),
+            total_volume_jeju=('거래량(톤)', 'sum'),
+            total_holidays=('주변공휴일', 'sum')
+        ).reset_index()
+        
+        # Create summary for non-Jeju region
+        non_jeju_summary = non_jeju_data.groupby(['연도', '주', '품목', '품종']).agg(
+            min_price_non_jeju=('일평균 도매가격(원/kg)', 'min'),
+            mean_price_non_jeju=('일평균 도매가격(원/kg)', 'mean'),
+            max_price_non_jeju=('일평균 도매가격(원/kg)', 'max'),
+            total_volume_non_jeju=('거래량(톤)', 'sum')
+        ).reset_index()
+        
+        return jeju_summary, non_jeju_summary
+    
+    def process_weather_data(self, weather_data: pd.DataFrame) -> pd.DataFrame:
+        """Process weather data"""
+        weather_data['일자'] = pd.to_datetime(weather_data['일자'], format='%Y%m%d')
+        weather_data['연도'] = weather_data['일자'].dt.year
+        weather_data['주'] = weather_data['일자'].dt.isocalendar().week
+        
+        # Calculate weekly averages for '새별오름' station
+        weather_summary = weather_data[weather_data['관측소명'] == '새별오름'].groupby(['연도', '주']).agg({
+            '평균기온': 'mean',
+            '일강수량': 'mean',
+            '평균 풍속': 'mean'
+        }).round(2).reset_index()
+        
+        return weather_summary
+    
+    def merge_all_data(self, jeju_summary: pd.DataFrame, non_jeju_summary: pd.DataFrame, 
+                      weather_summary: pd.DataFrame) -> pd.DataFrame:
+        """Merge all preprocessed data"""
+        # Merge Jeju and non-Jeju data
+        merged_data = pd.merge(
+            jeju_summary,
+            non_jeju_summary,
+            on=['연도', '주', '품목', '품종'],
+            how='left'
+        )
+        
+        # Merge with weather data
+        merged_data = pd.merge(
+            merged_data,
+            weather_summary,
+            on=['연도', '주'],
+            how='left'
+        )
+        
+        # Calculate cumulative weeks
+        def calculate_cumulative_weeks(row):
+            year_weeks = row['주']
+            if row['연도'] == merged_data['연도'].max() and year_weeks == 53:
+                return (row['연도'] - merged_data['연도'].min()) * 52 + year_weeks - 1
+            return (row['연도'] - merged_data['연도'].min()) * 52 + year_weeks
+        
+        merged_data['누적 주'] = merged_data.apply(calculate_cumulative_weeks, axis=1)
+        
+        return merged_data
+
+def main():
+    # Configuration
+    price_thresholds = {
+        '당근(일반)': 10000,
+        '깐마늘': 20000,
+        '세척무': 1800,
+        '양배추(일반)': 5000,
+        '만생양파': 2500,
+        '마늘(수입)': 15000,
+        '세척당근': 10000,
+        '조생양파': 3000
+    }
+    
+    config = ModelConfig()
+    preprocessor = DataPreprocessor(price_thresholds)
+    
+    # Load data
+    data = pd.read_csv("농산물거래량및가격데이터.csv")
+    holiday_data = pd.read_csv("공휴일데이터.csv")
+    weather_data = pd.read_csv("기상데이터.csv")
+    
+    # Process data
+    data = preprocessor.process_dates(data)
+    data = preprocessor.add_holiday_info(data, holiday_data)
+    data = preprocessor.filter_outliers(data)
+    data = preprocessor.remove_statistical_outliers(data)
+    
+    # Process regional and weather data
+    jeju_summary, non_jeju_summary = preprocessor.prepare_regional_data(data)
+    weather_summary = preprocessor.process_weather_data(weather_data)
+    
+    # Merge all data
+    merged_data = preprocessor.merge_all_data(jeju_summary, non_jeju_summary, weather_summary)
+    
+    # Filter for specific product
+    product_data = merged_data[merged_data['품종'] == '당근(일반)']
+    
+    return product_data
+
+if __name__ == "__main__":
+    processed_data = main()
+    print("Data processing completed successfully.")
+    print("Processed data shape:", processed_data.shape)
+    print("Available columns:", processed_data.columns.tolist())
