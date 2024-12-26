@@ -1,0 +1,183 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+import xgboost as xgb
+import lightgbm as lgb
+from typing import Dict, List, Tuple, Union
+from dataclasses import dataclass
+
+@dataclass
+class ModelConfig:
+    """Model configuration parameters"""
+    input_weeks: int = 4
+    predict_weeks: int = 12
+    n_splits: int = 5
+    n_estimators: int = 100
+    random_state: int = 42
+
+class PricePredictionModel:
+    """Handles model training and prediction"""
+    
+    def __init__(self, config: ModelConfig):
+        self.config = config
+        self.models = None
+        self.scores = None
+        
+    def create_sequences(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """Create input sequences for model training"""
+        features = []
+        targets = []
+        
+        feature_cols = [
+            'min_price_jeju', 'mean_price_jeju', 'max_price_jeju', 
+            'total_volume_jeju', 'total_holidays',
+            'min_price_non_jeju', 'mean_price_non_jeju', 
+            'max_price_non_jeju', 'total_volume_non_jeju',
+            '평균기온', '일강수량', '평균 풍속'
+        ]
+        
+        target_cols = ['min_price_jeju', 'mean_price_jeju', 'max_price_jeju']
+        
+        for _, group in data.groupby(['도매시장']):
+            group = group.sort_values(['연도', '주'])
+            
+            for i in range(len(group) - self.config.input_weeks - self.config.predict_weeks + 1):
+                input_features = group.iloc[i:i+self.config.input_weeks][feature_cols].values.flatten()
+                target_data = group.iloc[i+self.config.input_weeks:i+self.config.input_weeks+self.config.predict_weeks][target_cols].values.flatten()
+                
+                if len(target_data) == self.config.predict_weeks * 3:
+                    features.append(input_features)
+                    targets.append(target_data)
+        
+        return np.array(features), np.array(targets)
+    
+    def train_models(self, X: np.ndarray, y: np.ndarray) -> Tuple[Dict, Dict]:
+        """Train and evaluate models"""
+        tscv = TimeSeriesSplit(n_splits=self.config.n_splits)
+        
+        self.models = {
+            'RandomForest': [],
+            'XGBoost': [],
+            'LightGBM': []
+        }
+        
+        self.scores = {
+            model_name: {'r2': [], 'rmse': [], 'mae': []} 
+            for model_name in self.models.keys()
+        }
+        
+        for i in range(y.shape[1]):
+            models = {
+                'RandomForest': RandomForestRegressor(
+                    n_estimators=self.config.n_estimators, 
+                    random_state=self.config.random_state
+                ),
+                'XGBoost': xgb.XGBRegressor(
+                    n_estimators=self.config.n_estimators, 
+                    random_state=self.config.random_state
+                ),
+                'LightGBM': lgb.LGBMRegressor(
+                    n_estimators=self.config.n_estimators, 
+                    random_state=self.config.random_state
+                )
+            }
+            
+            for model_name, model in models.items():
+                fold_scores = self._evaluate_model(model, X, y[:, i], tscv)
+                self.models[model_name].append(model)
+                
+                for metric, scores in fold_scores.items():
+                    self.scores[model_name][metric].append(np.mean(scores))
+        
+        return self.models, self.scores
+    
+    def _evaluate_model(self, model, X: np.ndarray, y: np.ndarray, tscv) -> Dict[str, List[float]]:
+        """Evaluate model performance using cross-validation"""
+        fold_scores = {'r2': [], 'rmse': [], 'mae': []}
+        
+        for train_idx, val_idx in tscv.split(X):
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y[train_idx], y[val_idx]
+            
+            model.fit(X_train, y_train)
+            predictions = model.predict(X_val)
+            
+            fold_scores['r2'].append(r2_score(y_val, predictions))
+            fold_scores['rmse'].append(np.sqrt(mean_squared_error(y_val, predictions)))
+            fold_scores['mae'].append(mean_absolute_error(y_val, predictions))
+            
+        return fold_scores
+    
+    def predict_future_prices(self, input_data: np.ndarray) -> Dict[str, np.ndarray]:
+        """Predict future prices using trained models"""
+        if self.models is None:
+            raise ValueError("Models have not been trained yet")
+            
+        predictions = {}
+        for model_name, model_list in self.models.items():
+            model_preds = []
+            for model in model_list:
+                pred = model.predict([input_data])
+                model_preds.append(pred[0])
+            predictions[model_name] = np.array(model_preds)
+            
+        return predictions
+    
+    def get_best_model(self) -> str:
+        """Return the name of the best performing model based on RMSE"""
+        if self.scores is None:
+            raise ValueError("Models have not been evaluated yet")
+            
+        model_avg_rmse = {
+            model_name: np.mean(self.scores[model_name]['rmse'])
+            for model_name in self.models.keys()
+        }
+        
+        return min(model_avg_rmse.items(), key=lambda x: x[1])[0]
+
+def predict_for_market(model: PricePredictionModel, processed_data: pd.DataFrame, market_name: str, year: int, week: int) -> Dict[str, np.ndarray]:
+    """Predict future prices for a specific market"""
+    # Filter data for the specified market
+    market_data = processed_data[processed_data['도매시장'] == market_name]
+    
+    # Get the latest available data for the input features
+    latest_data = market_data[market_data['연도'] == year][market_data['주'] <= week].iloc[-model.config.input_weeks:]
+    
+    if latest_data.shape[0] < model.config.input_weeks:
+        raise ValueError("Not enough data to make a prediction.")
+    
+    # Prepare input data for prediction
+    input_features = latest_data[['min_price_jeju', 'mean_price_jeju', 'max_price_jeju', 
+                                   'total_volume_jeju', 'total_holidays',
+                                   'min_price_non_jeju', 'mean_price_non_jeju', 
+                                   'max_price_non_jeju', 'total_volume_non_jeju',
+                                   '평균기온', '일강수량', '평균 풍속']].values.flatten()
+    
+    # Use the model to predict future prices
+    predictions = model.predict_future_prices(input_features)
+    
+    return predictions
+
+def main():
+    config = ModelConfig()
+    model = PricePredictionModel(config)
+    
+    # Create sequences and train models
+    X, y = model.create_sequences(processed_data)
+    models, scores = model.train_models(X, y)
+    
+    # Get best model
+    best_model = model.get_best_model()
+    print(f"Best performing model: {best_model}")
+    
+    # Example prediction
+    predictions = predict_for_market(model, processed_data, "서울가락도매", 2023, 49)
+    print("Predictions:", predictions)
+    
+    return model
+
+if __name__ == "__main__":
+    main()
